@@ -77,10 +77,10 @@ Force the correct interface:
 MOBILE_MODE_INTERFACE=en0 mobile-mode
 ```
 
-Or force the IP directly (replace <your-ip-address> with your IP address:
+Or force the IP directly (replace your-ip-address with your IP address):
 
 ```bash
-MOBILE_MODE_LAN_IP=<your-ip-address> mobile-mode
+MOBILE_MODE_LAN_IP=your-ip-address mobile-mode
 ```
 
 ## Notes
