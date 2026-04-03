@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Managed by MovePro install-mobile-mode-commands.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$SCRIPT_DIR/.mobile-mode-common" local "$@"

@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# Managed by MovePro install-mobile-mode-commands.sh
+set -euo pipefail
+
+MODE="${1:-}"
+
+HERD_HOME="${MOBILE_MODE_HERD_HOME:-$HOME/Library/Application Support/Herd}"
+STATE_DIR="${MOBILE_MODE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mobile-mode}"
+DNSMASQ_FILE="$HERD_HOME/config/dnsmasq/dnsmasq.conf"
+NGINX_FILE="$HERD_HOME/config/nginx/herd.conf"
+BASELINE_DNSMASQ="$STATE_DIR/dnsmasq.conf.backup"
+BASELINE_NGINX="$STATE_DIR/herd.conf.backup"
+SKIP_DNSMASQ_KILL="${MOBILE_MODE_SKIP_DNSMASQ_KILL:-0}"
+SKIP_RESTART="${MOBILE_MODE_SKIP_RESTART:-0}"
+OVERRIDE_LAN_IP="${MOBILE_MODE_LAN_IP:-}"
+OVERRIDE_INTERFACE="${MOBILE_MODE_INTERFACE:-}"
+DETECTED_INTERFACE=""
+
+fail() {
+    printf 'Error: %s\n' "$1" >&2
+    exit 1
+}
+
+info() {
+    printf '%s\n' "$1"
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  mobile-mode
+  local-mode
+
+Environment overrides:
+  MOBILE_MODE_HERD_HOME            Override Herd config root for testing
+  MOBILE_MODE_STATE_DIR            Override backup state directory
+  MOBILE_MODE_LAN_IP               Force the LAN IP instead of auto-detecting
+  MOBILE_MODE_INTERFACE            Force a specific network interface, like en0
+  MOBILE_MODE_SKIP_DNSMASQ_KILL=1  Skip `sudo killall dnsmasq`
+  MOBILE_MODE_SKIP_RESTART=1       Skip `herd restart`
+USAGE
+}
+
+ensure_supported_mode() {
+    case "$MODE" in
+        mobile|local)
+            ;;
+        ""|-h|--help|help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "Unknown mode '$MODE'. Use mobile-mode or local-mode."
+            ;;
+    esac
+}
+
+ensure_required_files() {
+    [ -f "$DNSMASQ_FILE" ] || fail "Expected Herd dnsmasq config at $DNSMASQ_FILE"
+    [ -f "$NGINX_FILE" ] || fail "Expected Herd nginx config at $NGINX_FILE"
+}
+
+ensure_restart_tools() {
+    if [ "$SKIP_RESTART" != "1" ] && ! command -v herd >/dev/null 2>&1; then
+        fail "The `herd` CLI is required to restart services."
+    fi
+}
+
+is_ipv4() {
+    local candidate="$1"
+    local octet
+    local IFS=.
+    local parts=()
+
+    [ -n "$candidate" ] || return 1
+    read -r -a parts <<<"$candidate"
+    [ "${#parts[@]}" -eq 4 ] || return 1
+
+    for octet in "${parts[@]}"; do
+        case "$octet" in
+            ''|*[!0-9]*)
+                return 1
+                ;;
+        esac
+
+        if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+is_private_ipv4() {
+    local candidate="$1"
+    local second_octet
+
+    case "$candidate" in
+        10.*|192.168.*)
+            return 0
+            ;;
+        172.*)
+            second_octet="${candidate#172.}"
+            second_octet="${second_octet%%.*}"
+            if [ "$second_octet" -ge 16 ] && [ "$second_octet" -le 31 ]; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+interface_ipv4() {
+    local interface="$1"
+    local candidate=""
+
+    [ -n "$interface" ] || return 1
+
+    candidate="$(ipconfig getifaddr "$interface" 2>/dev/null || true)"
+    is_ipv4 "$candidate" || return 1
+
+    printf '%s\n' "$candidate"
+}
+
+wifi_interface_name() {
+    if ! command -v networksetup >/dev/null 2>&1; then
+        return 1
+    fi
+
+    networksetup -listallhardwareports 2>/dev/null | awk '
+        $0 == "Hardware Port: Wi-Fi" {
+            getline
+            if ($1 == "Device:") {
+                print $2
+                exit
+            }
+        }
+    '
+}
+
+detect_lan_ip() {
+    local default_interface=""
+    local wifi_interface=""
+    local candidate=""
+    local fallback_ip=""
+    local fallback_interface=""
+    local interface
+
+    if [ -n "$OVERRIDE_LAN_IP" ]; then
+        is_ipv4 "$OVERRIDE_LAN_IP" || fail "MOBILE_MODE_LAN_IP must be a valid IPv4 address."
+        DETECTED_INTERFACE="${OVERRIDE_INTERFACE:-manual-ip}"
+        printf '%s\n' "$OVERRIDE_LAN_IP"
+        return 0
+    fi
+
+    if ! command -v ipconfig >/dev/null 2>&1; then
+        fail "The `ipconfig` command is required to detect your LAN IP."
+    fi
+
+    if [ -n "$OVERRIDE_INTERFACE" ]; then
+        candidate="$(interface_ipv4 "$OVERRIDE_INTERFACE" || true)"
+        [ -n "$candidate" ] || fail "Unable to detect an IPv4 address on interface $OVERRIDE_INTERFACE."
+        DETECTED_INTERFACE="$OVERRIDE_INTERFACE"
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    wifi_interface="$(wifi_interface_name || true)"
+
+    if [ -n "$wifi_interface" ]; then
+        candidate="$(interface_ipv4 "$wifi_interface" || true)"
+
+        if is_ipv4 "$candidate"; then
+            if is_private_ipv4 "$candidate"; then
+                DETECTED_INTERFACE="$wifi_interface"
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+
+            fallback_ip="$candidate"
+            fallback_interface="$wifi_interface"
+        fi
+    fi
+
+    default_interface="$(route get default 2>/dev/null | awk '/interface: / { print $2; exit }' || true)"
+
+    if [ -n "$default_interface" ]; then
+        candidate="$(interface_ipv4 "$default_interface" || true)"
+
+        if is_ipv4 "$candidate"; then
+            if is_private_ipv4 "$candidate"; then
+                DETECTED_INTERFACE="$default_interface"
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+
+            fallback_ip="$candidate"
+            fallback_interface="$default_interface"
+        fi
+    fi
+
+    if command -v ifconfig >/dev/null 2>&1; then
+        for interface in $(ifconfig -l 2>/dev/null); do
+            [ -n "$interface" ] || continue
+            [ "$interface" = "$default_interface" ] && continue
+            [ "$interface" = "$wifi_interface" ] && continue
+            case "$interface" in
+                lo*|gif*|stf*|anpi*|ap*|bridge*|awdl*|llw*|utun*)
+                    continue
+                    ;;
+            esac
+
+            candidate="$(interface_ipv4 "$interface" || true)"
+            is_ipv4 "$candidate" || continue
+
+            if is_private_ipv4 "$candidate"; then
+                DETECTED_INTERFACE="$interface"
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+
+            if [ -z "$fallback_ip" ]; then
+                fallback_ip="$candidate"
+                fallback_interface="$interface"
+            fi
+        done
+    fi
+
+    [ -n "$fallback_ip" ] && {
+        DETECTED_INTERFACE="$fallback_interface"
+        printf '%s\n' "$fallback_ip"
+        return 0
+    }
+
+    fail "Unable to detect a LAN IPv4 address. Connect to Wi-Fi or re-run with MOBILE_MODE_LAN_IP=<your-mac-ip>."
+}
+
+assert_single_match() {
+    local file="$1"
+    local pattern="$2"
+    local description="$3"
+    local count
+
+    count="$(grep -Ec "$pattern" "$file" || true)"
+
+    if [ "$count" -ne 1 ]; then
+        fail "Expected exactly one $description in $file, found $count."
+    fi
+}
+
+replace_matching_line() {
+    local file="$1"
+    local pattern="$2"
+    local replacement="$3"
+    local description="$4"
+    local temp_file
+
+    assert_single_match "$file" "$pattern" "$description"
+
+    temp_file="$(mktemp "${TMPDIR:-/tmp}/mobile-mode-rewrite.XXXXXX")"
+
+    if ! awk -v pattern="$pattern" -v replacement="$replacement" '
+        BEGIN { count = 0 }
+        $0 ~ pattern {
+            print replacement
+            count++
+            next
+        }
+        { print }
+        END {
+            if (count != 1) {
+                exit 99
+            }
+        }
+    ' "$file" >"$temp_file"; then
+        rm -f "$temp_file"
+        fail "Unable to update $description in $file."
+    fi
+
+    chmod "$(stat -f '%Lp' "$file" 2>/dev/null || printf '644')" "$temp_file" 2>/dev/null || true
+    mv "$temp_file" "$file"
+}
+
+snapshot_baseline_once() {
+    mkdir -p "$STATE_DIR"
+
+    if { [ -f "$BASELINE_DNSMASQ" ] && [ ! -f "$BASELINE_NGINX" ]; } || { [ ! -f "$BASELINE_DNSMASQ" ] && [ -f "$BASELINE_NGINX" ]; }; then
+        fail "State directory $STATE_DIR is incomplete. Remove it or restore it before running mobile-mode again."
+    fi
+
+    if [ -f "$BASELINE_DNSMASQ" ] && [ -f "$BASELINE_NGINX" ]; then
+        return 0
+    fi
+
+    cp "$DNSMASQ_FILE" "$BASELINE_DNSMASQ"
+    cp "$NGINX_FILE" "$BASELINE_NGINX"
+}
+
+restart_services() {
+    if [ "$SKIP_DNSMASQ_KILL" != "1" ]; then
+        sudo killall dnsmasq >/dev/null 2>&1 || true
+    fi
+
+    if [ "$SKIP_RESTART" = "1" ]; then
+        return 0
+    fi
+
+    herd restart
+}
+
+run_mobile_mode() {
+    local lan_ip
+
+    lan_ip="$(detect_lan_ip)"
+
+    snapshot_baseline_once
+
+    replace_matching_line "$DNSMASQ_FILE" '^[[:space:]]*address=/\.test/[^[:space:]]+[[:space:]]*$' "address=/.test/$lan_ip" "dnsmasq .test address rule"
+    replace_matching_line "$DNSMASQ_FILE" '^[[:space:]]*listen-address=(127\.0\.0\.1|0\.0\.0\.0)[[:space:]]*$' 'listen-address=0.0.0.0' "dnsmasq listen-address"
+    replace_matching_line "$NGINX_FILE" '^[[:space:]]*listen (127\.0\.0\.1|0\.0\.0\.0):80 default_server;[[:space:]]*$' '    listen 0.0.0.0:80 default_server;' "nginx default listen"
+
+    restart_services
+
+    info "Mobile mode is active."
+    info "LAN IP: $lan_ip${DETECTED_INTERFACE:+ ($DETECTED_INTERFACE)}"
+    info ""
+    info "Next steps:"
+    info "1. Set your phone's DNS server to $lan_ip while testing."
+    info "2. Open your Herd site over HTTP, not HTTPS."
+    info "3. For apps/crm, run the dev server with VITE_HOST=0.0.0.0 npm run dev."
+    info "4. For apps/book, the Vite dev server already listens on all interfaces."
+    info ""
+    info "Run local-mode when you want to restore your previous Herd config."
+}
+
+run_local_mode() {
+    [ -f "$BASELINE_DNSMASQ" ] || fail "No dnsmasq backup found in $STATE_DIR. Run mobile-mode first."
+    [ -f "$BASELINE_NGINX" ] || fail "No nginx backup found in $STATE_DIR. Run mobile-mode first."
+
+    cp "$BASELINE_DNSMASQ" "$DNSMASQ_FILE"
+    cp "$BASELINE_NGINX" "$NGINX_FILE"
+
+    restart_services
+    rm -rf "$STATE_DIR"
+
+    info "Local mode is active."
+    info "Restored Herd config from $STATE_DIR."
+}
+
+main() {
+    ensure_supported_mode
+    ensure_required_files
+    ensure_restart_tools
+
+    case "$MODE" in
+        mobile)
+            run_mobile_mode
+            ;;
+        local)
+            run_local_mode
+            ;;
+    esac
+}
+
+main "$@"
