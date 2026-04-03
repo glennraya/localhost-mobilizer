@@ -298,6 +298,8 @@ snapshot_baseline_once() {
 }
 
 restart_services() {
+    local restart_status=0
+
     if [ "$SKIP_DNSMASQ_KILL" != "1" ]; then
         sudo killall dnsmasq >/dev/null 2>&1 || true
     fi
@@ -306,7 +308,12 @@ restart_services() {
         return 0
     fi
 
-    herd restart
+    set +e
+    herd restart 2>&1 | awk '!/^Restarting PHP \$_sock_/'
+    restart_status=${PIPESTATUS[0]}
+    set -e
+
+    return "$restart_status"
 }
 
 run_mobile_mode() {
@@ -327,9 +334,8 @@ run_mobile_mode() {
     info ""
     info "Next steps:"
     info "1. Set your phone's DNS server to $lan_ip while testing."
-    info "2. Open your Herd site over HTTP, not HTTPS."
-    info "3. For apps/crm, run the dev server with VITE_HOST=0.0.0.0 npm run dev."
-    info "4. For apps/book, the Vite dev server already listens on all interfaces."
+    info "2. Run your development server: npm run dev -- --host."
+    info "3. Open your local project URL on your phone and test. If your project uses a .test domain, you can open that on mobile too."
     info ""
     info "Run local-mode when you want to restore your previous Herd config."
 }

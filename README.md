@@ -38,7 +38,7 @@ export PATH="$HOME/.local/bin:$PATH"
 mobile-mode
 ```
 
-2. Start your frontend so it listens on the network:
+2. Run your development server:
 
 ```bash
 npm run dev -- --host
@@ -48,7 +48,8 @@ npm run dev -- --host
 
 - connect to the same Wi-Fi as your Mac
 - set the phone DNS to the IP shown by `mobile-mode`
-- open your site over `http`, not `https`
+- open your local project URL and test
+- if your project uses a `.test` domain, you can open that on mobile too
 
 4. Restore normal local setup when finished:
 
